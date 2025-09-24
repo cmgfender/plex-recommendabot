@@ -42,7 +42,7 @@ else:
 # ----------------------------
 PLEX_URL         = os.getenv("PLEX_URL", "http://127.0.0.1:32400")
 PLEX_TOKEN       = os.getenv("PLEX_TOKEN", "")
-PLEX_ACCOUNT_ID  = os.getenv("PLEX_ACCOUNT_ID", "")   # your Plex accountID (string)
+PLEX_ACCOUNT_ID  = os.getenv("PLEX_ACCOUNT_ID", "")
 
 LIBRARY_SECTIONS = [s.strip() for s in os.getenv("LIBRARY_SECTIONS", "Movies,TV Shows").split(",")]
 
@@ -52,7 +52,7 @@ LON              = float(os.getenv("LON", "-75.1652"))
 USE_LLM          = os.getenv("USE_LLM", "false").lower() == "true"
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-LLM_SEND_N       = int(os.getenv("LLM_SEND_N", "120"))   # larger candidate sampling for LLM
+LLM_SEND_N       = int(os.getenv("LLM_SEND_N", "120"))
 
 COLLECTION_BASE  = os.getenv("COLLECTION_BASE", "Recommended Today")
 LOOKBACK_MONTHS  = int(os.getenv("LOOKBACK_MONTHS", "7"))
@@ -64,15 +64,23 @@ DRY_RUN          = os.getenv("DRY_RUN", "false").lower() == "true"
 MIN_REREC_DAYS      = int(os.getenv("MIN_REREC_DAYS", "14"))
 FULL_RECOVERY_DAYS  = int(os.getenv("FULL_RECOVERY_DAYS", "45"))
 
-# Episode cap = max EPISODES PER SHOW (not number of shows)
+# Episode cap = max EPISODES PER SHOW
 EPISODE_SHOW_CAP    = int(os.getenv("EPISODE_SHOW_CAP", "2"))
+
+# Hard limits for never-watched items (0+). Default 1 each.
+MAX_NEVER_WATCHED_MOVIES   = int(os.getenv("MAX_NEVER_WATCHED_MOVIES", "1"))
+MAX_NEVER_WATCHED_EPISODES = int(os.getenv("MAX_NEVER_WATCHED_EPISODES", "1"))
+
+# Performance knobs: prefilter how many items to fully fetch per run
+PREFETCH_LIMIT_MOVIES   = int(os.getenv("PREFETCH_LIMIT_MOVIES", "1500"))
+PREFETCH_LIMIT_EPISODES = int(os.getenv("PREFETCH_LIMIT_EPISODES", "2500"))
 
 # Caching
 CACHE_DIR              = os.path.join(BASE_DIR, ".cache")
-CACHE_TTL_MINUTES      = int(os.getenv("CACHE_TTL_MINUTES", "360"))  # 6h default
+CACHE_TTL_MINUTES      = int(os.getenv("CACHE_TTL_MINUTES", "360"))
 REFRESH_CACHE          = os.getenv("REFRESH_CACHE", "false").lower() == "true"
-CACHE_KEY_PREFIX       = "inventory_v1"  # bump if you change structures
-ITEM_CACHE_PATH        = os.path.join(CACHE_DIR, "item_cache_v1.json")
+CACHE_KEY_PREFIX       = "inventory_v1"
+ITEM_CACHE_PATH        = os.path.join(CACHE_DIR, "item_cache_v2.json")  # v2 adds guids/titleKey
 RECOMMEND_HISTORY_PATH = os.path.join(CACHE_DIR, "recommend_history_v1.json")
 
 # ----------------------------
@@ -86,6 +94,9 @@ log.info("[LLM] enabled=%s | key=%s | model=%s | send_n=%s",
          USE_LLM, "yes" if OPENAI_API_KEY else "no", OPENAI_MODEL, LLM_SEND_N)
 log.info("[DECAY] min_days=%s full_recovery_days=%s | EPISODE_SHOW_CAP=%s",
          MIN_REREC_DAYS, FULL_RECOVERY_DAYS, EPISODE_SHOW_CAP)
+log.info("[NEVER] max_unwatched_movies=%s max_unwatched_eps=%s",
+         MAX_NEVER_WATCHED_MOVIES, MAX_NEVER_WATCHED_EPISODES)
+log.info("[PREFETCH] movies=%s episodes=%s", PREFETCH_LIMIT_MOVIES, PREFETCH_LIMIT_EPISODES)
 log.info("[CACHE] dir=%s ttl_min=%s refresh=%s", CACHE_DIR, CACHE_TTL_MINUTES, REFRESH_CACHE)
 
 if not PLEX_TOKEN:
@@ -149,7 +160,7 @@ def weather_bucket(current: Dict) -> str:
     return "clear"
 
 def months_ago_ts(n: int) -> int:
-    cutoff = now_local() - dt.timedelta(days=int(n*30.437))  # ~avg month
+    cutoff = now_local() - dt.timedelta(days=int(n*30.437))
     return int(cutoff.timestamp())
 
 def extract_guids(item) -> Set[str]:
@@ -185,11 +196,6 @@ def stable_key_for_title(item) -> str:
 # History (paged with cutoff buffer)
 # ----------------------------
 def get_history_until_cutoff(max_fetch: int, cutoff_ts: int) -> List[Dict]:
-    """
-    Page history newest→older until:
-      - read >= max_fetch rows, OR
-      - crossed cutoff and read >= 3 pages (buffer to avoid boundary misses)
-    """
     t0 = time.time()
     out: List[Dict] = []
     start = 0
@@ -240,12 +246,6 @@ def filter_history_by_account(items: List[Dict], account_id: str) -> List[Dict]:
     return out
 
 def build_last_seen_maps(history_rows: List[Dict]) -> Tuple[Dict[str,int], Dict[str,int], Dict[str,int]]:
-    """
-    Returns:
-      - last_view_ts_by_rk: ratingKey -> last viewed ts
-      - last_view_ts_by_guid: guid -> last viewed ts
-      - last_view_ts_by_titlekey: fallback key -> last viewed ts
-    """
     t0 = time.time()
     last_view_ts_by_rk: Dict[str,int] = {}
     last_view_ts_by_guid: Dict[str,int] = {}
@@ -288,20 +288,12 @@ def build_last_seen_maps(history_rows: List[Dict]) -> Tuple[Dict[str,int], Dict[
     return last_view_ts_by_rk, last_view_ts_by_guid, last_view_ts_by_titlekey
 
 def last_seen_timestamp(item, rk_map: Dict[str,int], guid_map: Dict[str,int], title_map: Dict[str,int]) -> Optional[int]:
-    """
-    Best-effort last-seen for the *current token user*:
-      1) item.lastViewedAt (per-user)
-      2) ratingKey map from filtered history
-      3) any GUID map from filtered history
-      4) title|year|type|show fallback
-    """
     try:
         lva = getattr(item, "lastViewedAt", None)
         if lva:
             return int(lva.timestamp())
     except Exception:
         pass
-
     rk = str(getattr(item, "ratingKey", "") or "")
     if rk and rk in rk_map:
         return rk_map[rk]
@@ -347,7 +339,7 @@ def genre_bonus(genres: List[str], weather_b: Dict[str,float], season_b: Dict[st
 def recency_decay(days_since_watch: Optional[float]) -> float:
     if days_since_watch is None:
         return 1.0
-    return min(1.0, max(0.1, days_since_watch/210.0))  # 7 months ~210 days
+    return min(1.0, max(0.1, days_since_watch/210.0))
 
 def _extract_genres_with_fallback(item) -> List[str]:
     genres: List[str] = []
@@ -367,13 +359,12 @@ def _extract_genres_with_fallback(item) -> List[str]:
 
 def score_item(item, rk_map: Dict[str,int], guid_map: Dict[str,int], title_map: Dict[str,int],
                weather_b: Dict[str,float], season_b: Dict[str,float]) -> Tuple[float, Dict[str, float]]:
-    """Return (score, breakdown) so we can explain to the LLM."""
     lv = last_seen_timestamp(item, rk_map, guid_map, title_map)
     days = None
     if lv:
         days = (now_local().timestamp() - lv)/86400.0
     base = 1.0
-    ur = fetch_user_rating(item)  # 0..10 (or None)
+    ur = fetch_user_rating(item)
     my_rating_term = 0.0 if ur is None else (ur/10.0)*2.5
     rec = recency_decay(days) * 1.0
     genres = _extract_genres_with_fallback(item)
@@ -456,6 +447,16 @@ def snapshot_item_fields(it) -> dict:
     except Exception:
         last_seen_ts = None
 
+    # NEW: persist guids + titleKey so we can use maps without re-fetch
+    try:
+        guids = list(extract_guids(it))
+    except Exception:
+        guids = []
+    try:
+        tkey = stable_key_for_title(it)
+    except Exception:
+        tkey = ""
+
     return {
         "rk": int(getattr(it, "ratingKey", 0) or 0),
         "title": getattr(it, "title", ""),
@@ -464,68 +465,61 @@ def snapshot_item_fields(it) -> dict:
         "genres": genres,
         "userRating": getattr(it, "userRating", None),
         "lastSeenTs": last_seen_ts,
+        "guids": guids,
+        "titleKey": tkey,
         "updatedAt": int(time.time()),
     }
 
-def decay_penalty(now_ts: int, last_rec_ts: int) -> Tuple[bool, float]:
-    """
-    Returns (blocked, penalty_factor). blocked=True if inside MIN_REREC_DAYS.
-    Otherwise returns a 0..0.5 penalty (subtract from score) decaying to 0 by FULL_RECOVERY_DAYS.
-    """
-    delta_days = (now_ts - last_rec_ts) / 86400.0
-    if delta_days < MIN_REREC_DAYS:
-        return True, 0.5  # blocked window
-    if delta_days >= FULL_RECOVERY_DAYS:
-        return False, 0.0
-    f = 1.0 - (delta_days - MIN_REREC_DAYS) / max(1.0, (FULL_RECOVERY_DAYS - MIN_REREC_DAYS))
-    return False, 0.5 * max(0.0, min(1.0, f))
+# speedy last-seen using cache+maps (no fetch)
+def cached_last_seen_for_rk(rk: int, snap: dict,
+                            rk_map: Dict[str,int], guid_map: Dict[str,int], title_map: Dict[str,int]) -> Optional[int]:
+    if snap and snap.get("lastSeenTs") is not None:
+        return snap["lastSeenTs"]
+    rk_s = str(rk)
+    if rk_s in rk_map:
+        return rk_map[rk_s]
+    for gid in (snap.get("guids") or []):
+        if gid in guid_map:
+            return guid_map[gid]
+    tkey = snap.get("titleKey") or ""
+    if tkey and tkey in title_map:
+        return title_map[tkey]
+    return None
 
-def adjust_for_rerec(score: float, item, _rk_map_unused: Dict[str,int], rechist: Dict[str, dict]) -> Tuple[float, bool]:
-    """Apply decay/blocks if the item was recently recommended but not watched yet."""
-    rk = str(getattr(item, "ratingKey", "") or "")
-    if not rk:
-        return score, False
-    rec = rechist.get(rk)
-    if not rec:
-        return score, False
-
-    last_rec_ts = rec.get("last_recommended_ts", 0)
-    if not last_rec_ts:
-        return score, False
-
-    # If watched after recommended → clear history entry
-    lv = None
-    try:
-        lva = getattr(item, "lastViewedAt", None)
-        if lva:
-            lv = int(lva.timestamp())
-    except Exception:
-        pass
-    if lv and lv > last_rec_ts:
-        rechist.pop(rk, None)
-        return score, False
-
-    blocked, pen = decay_penalty(int(time.time()), last_rec_ts)
-    if blocked:
-        return -1e9, True  # effectively exclude
-    return score - pen, False
+# quick approximate score using only the snapshot (no fetch)
+def approx_score_from_snap(snap: dict, wb: Dict[str,float], sb: Dict[str,float]) -> float:
+    base = 1.0
+    ur = snap.get("userRating", None)
+    my_rating_term = 0.0 if ur is None else (ur/10.0)*2.5
+    lv = snap.get("lastSeenTs", None)
+    days = None
+    if lv:
+        days = (now_local().timestamp() - lv)/86400.0
+    rec = recency_decay(days) * 1.0
+    genres = snap.get("genres") or []
+    mood = genre_bonus(genres, wb, sb)
+    # skip show bonus here (approx)
+    return base + my_rating_term + rec + mood
 
 # ----------------------------
-# Inventory (Movies + Episodes) with caching
+# Inventory (Movies + Episodes) with caching + PREFILTER
 # ----------------------------
-def build_inventory_with_cache(sections: List[str],
-                               rk_map: Dict[str,int],
-                               guid_map: Dict[str,int],
-                               title_map: Dict[str,int],
-                               cutoff_ts: int):
-    """
-    Cache a snapshot of library inventory (ratingKeys only),
-    then materialize with selective fetch & per-item cache.
-    """
+def build_inventory_with_cache_and_prefilter(
+    sections: List[str],
+    rk_map: Dict[str,int],
+    guid_map: Dict[str,int],
+    title_map: Dict[str,int],
+    cutoff_ts: int,
+    wb: Dict[str,float],
+    sb: Dict[str,float],
+    prefetch_limit_movies: int,
+    prefetch_limit_eps: int
+):
     key_raw = f"{CACHE_KEY_PREFIX}|{','.join(sections)}"
     cache_name = f"{hash_key(key_raw)}.json"
     path = cache_path(cache_name)
 
+    # 1) inventory index (ratingKeys) cached
     if not REFRESH_CACHE and is_cache_fresh(path, CACHE_TTL_MINUTES):
         log.info("[CACHE] Using cached inventory: %s", path)
         inv = load_json(path)
@@ -533,7 +527,6 @@ def build_inventory_with_cache(sections: List[str],
         t0 = time.time()
         log.info("[CACHE] Rebuilding inventory for sections=%s ...", sections)
         inv = {"movies": [], "episodes": [], "meta": {"sections": sections, "built_at": time.time()}}
-
         for name in sections:
             try:
                 section = plex.library.section(name)
@@ -551,7 +544,6 @@ def build_inventory_with_cache(sections: List[str],
                 for mv in movies:
                     if getattr(mv, "type", "") == "movie":
                         inv["movies"].append(int(getattr(mv, "ratingKey", 0) or 0))
-
             elif stype in ("show", "episode", "tv", "show-mixed"):
                 try:
                     shows = section.all()
@@ -568,70 +560,96 @@ def build_inventory_with_cache(sections: List[str],
                             inv["episodes"].append(int(getattr(ep, "ratingKey", 0) or 0))
             else:
                 log.info("Library '%s' (type=%s) not recognized as movie or TV; skipping.", name, stype)
-
         save_json(path, inv)
         log.info("[CACHE] Inventory built: %d movies, %d episodes (elapsed: %.2fs) → %s",
                  len(inv["movies"]), len(inv["episodes"]), time.time() - t0, path)
 
-    def materialize(keys: List[int], label: str, rk_map, guid_map, title_map, cutoff_ts) -> List[object]:
+    # 2) PREFILTER using item snapshots (no fetch)
+    item_cache = load_item_cache()
+    def preselect(keys: List[int], label: str, limit: int) -> List[int]:
+        scored: List[Tuple[float, int]] = []
+        missing_snap = 0
+        for rk in keys:
+            snap = item_cache.get(str(rk))
+            if snap:
+                # inject lastSeen from maps if missing
+                if snap.get("lastSeenTs") is None:
+                    ls = cached_last_seen_for_rk(rk, snap, rk_map, guid_map, title_map)
+                    if ls is not None:
+                        snap = dict(snap)
+                        snap["lastSeenTs"] = ls
+                        item_cache[str(rk)] = snap  # keep improved snapshot
+                # cutoff check
+                lsv = snap.get("lastSeenTs")
+                if lsv and lsv >= cutoff_ts:
+                    continue
+                s = approx_score_from_snap(snap, wb, sb)
+                scored.append((s, rk))
+            else:
+                # No snapshot yet; we won't score it now (first run will fetch more, later runs speed up)
+                missing_snap += 1
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        chosen = [rk for _, rk in scored[:limit]]  # only fetch the top approximate
+        # If we don't have enough (e.g., first run), fall back to including some unknowns
+        if len(chosen) < min(limit, len(keys)):
+            # add some 'unknown' (no snapshot) keys to let the cache warm up gradually
+            unknowns = [rk for rk in keys if str(rk) not in item_cache]
+            chosen += unknowns[: max(0, limit - len(chosen))]
+        log.info("[PREFILTER] %s: chosen=%d (limit=%d, missing_snapshots=%d)", label, len(chosen), limit, missing_snap)
+        return chosen
+
+    movie_prefetch_keys = preselect(inv.get("movies", []), "Movies", prefetch_limit_movies)
+    ep_prefetch_keys    = preselect(inv.get("episodes", []), "TV Episodes", prefetch_limit_eps)
+    save_item_cache(item_cache)  # save any improved snapshots
+
+    # 3) Materialize ONLY the preselected keys (fetch from Plex if needed)
+    def materialize(keys: List[int], label: str) -> List[object]:
         items = []
         item_cache = load_item_cache()
         updated = 0
-        skipped = 0
         fetched = 0
+        skipped_cutoff = 0
         t0 = time.time()
-
-        must_refresh: Set[int] = set(int(k) for k in rk_map.keys() if k is not None)
 
         for rk in keys:
             rk_str = str(rk)
-            cached = item_cache.get(rk_str)
-            need_fetch = REFRESH_CACHE or (rk in must_refresh) or (cached is None)
-
+            snap = item_cache.get(rk_str)
             it = None
-            if need_fetch:
-                try:
-                    it = plex.fetchItem(int(rk))
-                    fetched += 1
-                except Exception:
-                    it = None
-                if not it:
+
+            # cutoff test using snapshot+maps without fetching
+            if snap:
+                ls = cached_last_seen_for_rk(rk, snap, rk_map, guid_map, title_map)
+                if ls is not None:
+                    snap = dict(snap)
+                    snap["lastSeenTs"] = ls
+                    item_cache[rk_str] = snap
+                if snap.get("lastSeenTs") and snap["lastSeenTs"] >= cutoff_ts:
+                    skipped_cutoff += 1
                     continue
-                snap = snapshot_item_fields(it)
-                item_cache[rk_str] = snap
-                updated += 1
-            else:
-                snap = cached
 
-            # cutoff check using best available last-seen
-            if snap.get("lastSeenTs") is None:
-                if it is None:
-                    try:
-                        it = plex.fetchItem(int(rk))
-                        fetched += 1
-                    except Exception:
-                        it = None
-                lv = last_seen_timestamp(it, rk_map, guid_map, title_map) if it else None
-                snap["lastSeenTs"] = lv
-                if it is not None:
-                    item_cache[rk_str] = snapshot_item_fields(it)
-
-            if snap.get("lastSeenTs") and snap["lastSeenTs"] >= cutoff_ts:
-                skipped += 1
+            # fetch object only if needed (to enable detailed scoring & collection writes)
+            try:
+                it = plex.fetchItem(int(rk))
+                fetched += 1
+            except Exception:
+                it = None
+            if not it:
                 continue
 
-            if it is not None:
-                items.append(it)
-            else:
-                items.append(rk)
+            # refresh snapshot for future runs
+            item_cache[rk_str] = snapshot_item_fields(it)
+            updated += 1
+
+            items.append(it)
 
         save_item_cache(item_cache)
         log.info("Materialized %d %s (after cutoff) [fetched=%d, cache_updates=%d, skipped_cutoff=%d] (%.2fs)",
-                 len(items), label, fetched, updated, skipped, time.time() - t0)
+                 len(items), label, fetched, updated, skipped_cutoff, time.time() - t0)
         return items
 
-    movie_items = materialize(inv.get("movies", []), "movies", rk_map, guid_map, title_map, cutoff_ts)
-    ep_items    = materialize(inv.get("episodes", []), "episodes", rk_map, guid_map, title_map, cutoff_ts)
+    movie_items = materialize(movie_prefetch_keys, "movies")
+    ep_items    = materialize(ep_prefetch_keys, "episodes")
     return movie_items, ep_items
 
 # ----------------------------
@@ -641,7 +659,6 @@ def ensure_collection_update(section_name: str, title: str, items: List):
     if DRY_RUN:
         log.info("[DRY RUN] Would upsert collection '%s' in '%s' with %d items.", title, section_name, len(items))
         return
-
     section = plex.library.section(section_name)
     existing = None
     try:
@@ -690,7 +707,6 @@ def ensure_collection_update(section_name: str, title: str, items: List):
 # Top/Bottom context from full library (no overlap)
 # ----------------------------
 def _iter_all_items_for_type(sections: List[str], kind: str) -> List[object]:
-    """All items of a type from library (no cutoff)."""
     out = []
     for name in sections:
         try:
@@ -715,17 +731,11 @@ def _iter_all_items_for_type(sections: List[str], kind: str) -> List[object]:
     return out
 
 def build_rating_context_all(sections: List[str], kind: str, top_n: int = 15) -> Tuple[List[object], List[object]]:
-    """
-    True top/bottom lists (no overlap) from entire library by userRating.
-    'kind' is 'movie' or 'episode'.
-    """
     items = _iter_all_items_for_type(sections, kind)
     rated = [(getattr(i, "userRating", None) or -1, i) for i in items]
-    rated = [p for p in rated if p[0] >= 0]  # only items you rated
+    rated = [p for p in rated if p[0] >= 0]
     if not rated:
         return [], []
-
-    # Highest — bias to 9–10 if available
     rated.sort(key=lambda x: x[0], reverse=True)
     highest = []
     seen = set()
@@ -737,13 +747,10 @@ def build_rating_context_all(sections: List[str], kind: str, top_n: int = 15) ->
         seen.add(rk)
         if len(highest) >= top_n:
             break
-
     high9 = [it for it in highest if (getattr(it, "userRating", 0) or 0) >= 9]
     if len(high9) >= 6:
         highest = high9[:min(len(high9), top_n)]
-
-    # Lowest — exclude anything already in highest
-    rated_lo = sorted(rated, key=lambda x: x[0])  # ascending
+    rated_lo = sorted(rated, key=lambda x: x[0])
     lowest = []
     for r, it in rated_lo:
         rk = getattr(it, "ratingKey", None)
@@ -752,7 +759,6 @@ def build_rating_context_all(sections: List[str], kind: str, top_n: int = 15) ->
         lowest.append(it)
         if len(lowest) >= top_n:
             break
-
     return highest, lowest
 
 # ----------------------------
@@ -803,21 +809,14 @@ def _candidate_json_tuple(score: float, breakdown: Dict[str, float], obj) -> Dic
     }
 
 def stratified_pool(scored: List[Tuple[float, object]], send_n: int) -> List[Tuple[float, object]]:
-    """
-    Build a diverse pool: top / middle / long-tail slices.
-    Deterministic-ish via date-based seed to vary day-to-day.
-    """
     n = len(scored)
     if n <= send_n:
         return scored[:]
-
     today_seed = int(dt.datetime.now().strftime("%Y%m%d"))
     random.seed(today_seed)
-
     top_n = max(10, int(send_n * 0.4))
     mid_n = max(10, int(send_n * 0.35))
     tail_n = max(10, send_n - top_n - mid_n)
-
     top_slice = scored[:max(top_n*2, top_n+20)]
     mid_start = n // 3
     mid_end = 2 * n // 3
@@ -859,14 +858,11 @@ def llm_rerank_list(label: str,
         return candidates[:TOPK_RECS]
     if not candidates:
         return candidates
-
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
 
-        # Build a stratified, decay-adjusted pool
         pool = stratified_pool(candidates, min(LLM_SEND_N, len(candidates)))
-
         send_objs = []
         kept_pairs = []
         blocked_count = 0
@@ -874,8 +870,8 @@ def llm_rerank_list(label: str,
             rk = getattr(o, "ratingKey", None)
             sc_b = scored_breakdowns.get(int(rk)) if rk is not None else None
             if sc_b is None:
-                sc_b = {"base": 0.0, "my_rating_term": 0.0, "recency_term": 0.0, "mood_term": 0.0,
-                        "show_bonus": 0.0, "days_since_watch": -1, "user_rating": -1}
+                sc_b = {"base":0.0,"my_rating_term":0.0,"recency_term":0.0,"mood_term":0.0,"show_bonus":0.0,
+                        "days_since_watch":-1,"user_rating":-1}
             adj_sc, blocked = adjust_for_rerec(sc, o, {}, rechist)
             if blocked:
                 blocked_count += 1
@@ -884,7 +880,6 @@ def llm_rerank_list(label: str,
             send_objs.append(_candidate_json_tuple(adj_sc, sc_b, o))
 
         if not kept_pairs:
-            log.info("[LLM] %s: All candidates blocked by re-recency window; falling back to original candidates.", label)
             kept_pairs = candidates[:LLM_SEND_N]
             send_objs = []
             for sc, o in kept_pairs:
@@ -911,9 +906,9 @@ def llm_rerank_list(label: str,
             "task": f"Select the top {TOPK_RECS} {label.lower()} to recommend tonight.",
             "preferences": [
                 "Prioritize my user rating first.",
-                "Prefer things I haven't seen in a long time (more days since last watch is better).",
+                "Prefer items not watched recently.",
                 "Season & weather genre fit should influence ties.",
-                "A mix of obvious favorites and some variety is welcome."
+                "Keep a balance of obvious favorites and some variety."
             ],
             "context": {
                 "weather_bucket": weather,
@@ -922,27 +917,22 @@ def llm_rerank_list(label: str,
                 "lowest_rated_examples": lo
             },
             "candidates": send_objs,
-            "output_format": {
-                "type": "json",
-                "fields": ["ratingKey"],
-                "array_name": "picks"
-            },
+            "output_format": {"type":"json","fields":["ratingKey"],"array_name":"picks"},
             "instructions": [
-                "Return JSON only. Example: {\"picks\": [12345, 67890, ...]}",
-                f"Pick exactly {TOPK_RECS} unique ratingKeys, in order of recommendation strength."
+                f"Return JSON only. Example: {{\"picks\": [12345, 67890, ...]}}",
+                f"Pick exactly {TOPK_RECS} unique ratingKeys, in order."
             ]
         }
 
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a sharp, decisive recommender. Output strictly valid JSON only."},
-                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}
+                {"role":"system","content":"You are a sharp, decisive recommender. Output strictly valid JSON only."},
+                {"role":"user","content": json.dumps(prompt, ensure_ascii=False)}
             ],
             temperature=0.2
         )
         text = resp.choices[0].message.content.strip()
-
         import re as _re
         data = json.loads(_re.search(r"\{.*\}", text, _re.S).group(0))
         rk_list = data.get("picks", [])
@@ -980,7 +970,7 @@ def ensure_real_objects(pairs: List[Tuple[float, object]]) -> List[Tuple[float, 
         out.append((sc, o))
     return out
 
-# Enforce MAX EPISODES PER SHOW (not number of shows)
+# Enforce MAX EPISODES PER SHOW
 def enforce_episode_show_cap(pairs: List[Tuple[float, object]], cap: int) -> List[Tuple[float, object]]:
     if cap <= 0:
         return pairs
@@ -997,7 +987,7 @@ def enforce_episode_show_cap(pairs: List[Tuple[float, object]], cap: int) -> Lis
     return out
 
 # ----------------------------
-# Backfill to guaranteed minimums
+# Backfill + Never-watched limit enforcement
 # ----------------------------
 def _not_in_selected(selected: List[Tuple[float, object]], cand_obj) -> bool:
     sel_ids = {getattr(o, "ratingKey", None) for _, o in selected}
@@ -1010,6 +1000,74 @@ def _passes_show_cap(selected: List[Tuple[float, object]], cand_obj, cap: int) -
     counts = Counter(getattr(o, "grandparentTitle", "") or "" for _, o in selected if getattr(o, "type", "") == "episode")
     return counts[(getattr(cand_obj, "grandparentTitle", "") or "")] < cap
 
+def _is_unwatched(obj, rk_map: Dict[str,int], guid_map: Dict[str,int], title_map: Dict[str,int]) -> bool:
+    return last_seen_timestamp(obj, rk_map, guid_map, title_map) is None
+
+def limit_never_watched_and_backfill(
+    label: str,
+    selected: List[Tuple[float, object]],
+    scored_all: List[Tuple[float, object]],
+    desired_n: int,
+    max_never_watched: int,
+    rk_map: Dict[str,int],
+    guid_map: Dict[str,int],
+    title_map: Dict[str,int],
+    is_tv: bool = False,
+    show_cap: int = 0,
+    rechist: Optional[Dict[str, dict]] = None
+) -> List[Tuple[float, object]]:
+    """Trim selection to obey never-watched cap, then backfill to reach desired_n."""
+    rechist = rechist or {}
+    watched = []
+    unwatched = []
+    for sc, o in selected:
+        if _is_unwatched(o, rk_map, guid_map, title_map):
+            unwatched.append((sc, o))
+        else:
+            watched.append((sc, o))
+
+    # Keep up to cap from unwatched (preserve order)
+    kept_unwatched = unwatched[:max_never_watched]
+    trimmed = watched + kept_unwatched
+    # Backfill from scored_all respecting caps and uniqueness
+    def can_add(obj):
+        if not _not_in_selected(trimmed, obj):
+            return False
+        if is_tv and not _passes_show_cap(trimmed, obj, show_cap):
+            return False
+        return True
+
+    # prefer watched backfill first
+    for sc, o in scored_all:
+        if len(trimmed) >= desired_n:
+            break
+        if _is_unwatched(o, rk_map, guid_map, title_map):
+            continue
+        if not can_add(o):
+            continue
+        adj_sc, blocked = adjust_for_rerec(sc, o, {}, rechist)
+        if blocked:
+            continue
+        trimmed.append((adj_sc, o))
+
+    # if still short, allow additional unwatched beyond the cap (as last resort)
+    if len(trimmed) < desired_n:
+        for sc, o in scored_all:
+            if len(trimmed) >= desired_n:
+                break
+            if not _is_unwatched(o, rk_map, guid_map, title_map):
+                continue
+            if not can_add(o):
+                continue
+            adj_sc, blocked = adjust_for_rerec(sc, o, {}, rechist)
+            if blocked:
+                continue
+            trimmed.append((adj_sc, o))
+
+    if len(trimmed) < desired_n:
+        log.warning("[%s] Could not reach desired minimum %d (have %d).", label, desired_n, len(trimmed))
+    return trimmed[:desired_n]
+
 def backfill_to_min(
     label: str,
     selected: List[Tuple[float, object]],
@@ -1019,10 +1077,6 @@ def backfill_to_min(
     show_cap: int = 0,
     rechist: Optional[Dict[str, dict]] = None
 ) -> List[Tuple[float, object]]:
-    """
-    Ensure we reach desired_n items by walking the scored list and adding the next best
-    that aren't selected yet; respect per-show episode cap and decay/blocks.
-    """
     rechist = rechist or {}
     out = list(selected)
     for sc, o in scored_all:
@@ -1040,6 +1094,40 @@ def backfill_to_min(
         log.warning("[%s] Could not reach desired minimum %d (have %d).", label, desired_n, len(out))
     return out
 
+def decay_penalty(now_ts: int, last_rec_ts: int) -> Tuple[bool, float]:
+    delta_days = (now_ts - last_rec_ts) / 86400.0
+    if delta_days < MIN_REREC_DAYS:
+        return True, 0.5
+    if delta_days >= FULL_RECOVERY_DAYS:
+        return False, 0.0
+    f = 1.0 - (delta_days - MIN_REREC_DAYS) / max(1.0, (FULL_RECOVERY_DAYS - MIN_REREC_DAYS))
+    return False, 0.5 * max(0.0, min(1.0, f))
+
+def adjust_for_rerec(score: float, item, _rk_map_unused: Dict[str,int], rechist: Dict[str, dict]) -> Tuple[float, bool]:
+    rk = str(getattr(item, "ratingKey", "") or "")
+    if not rk:
+        return score, False
+    rec = rechist.get(rk)
+    if not rec:
+        return score, False
+    last_rec_ts = rec.get("last_recommended_ts", 0)
+    if not last_rec_ts:
+        return score, False
+    lv = None
+    try:
+        lva = getattr(item, "lastViewedAt", None)
+        if lva:
+            lv = int(lva.timestamp())
+    except Exception:
+        pass
+    if lv and lv > last_rec_ts:
+        rechist.pop(rk, None)
+        return score, False
+    blocked, pen = decay_penalty(int(time.time()), last_rec_ts)
+    if blocked:
+        return -1e9, True
+    return score - pen, False
+
 # ----------------------------
 # main
 # ----------------------------
@@ -1055,7 +1143,7 @@ def main():
         sb = SEASON_GENRE_BONUS.get(season, {})
         log.info("Weather bucket: %s | Season: %s", wbucket, season)
 
-        # History: fetch ALL within LOOKBACK, then filter by account, then limit
+        # History
         cutoff = months_ago_ts(LOOKBACK_MONTHS)
         raw_history = get_history_until_cutoff(max_fetch=MAX_HISTORY, cutoff_ts=cutoff)
         ac_counts = Counter(str(x.get("accountID","")) for x in raw_history)
@@ -1064,19 +1152,19 @@ def main():
             log.info("Configured PLEX_ACCOUNT_ID=%s", PLEX_ACCOUNT_ID)
         history = filter_history_by_account(raw_history, PLEX_ACCOUNT_ID)[:MAX_HISTORY]
 
-        # Build last-seen maps from filtered history
         rk_map, guid_map, title_map = build_last_seen_maps(history)
 
-        # Build true top/bottom contexts from full library (no overlap)
+        # True top/bottom contexts
         top15_movies, bot15_movies = build_rating_context_all(LIBRARY_SECTIONS, "movie", top_n=15)
         top15_eps,    bot15_eps    = build_rating_context_all(LIBRARY_SECTIONS, "episode", top_n=15)
 
-        # Inventory from cache (fast), filtered by cutoff using last-seen maps
-        movie_candidates, ep_candidates = build_inventory_with_cache(
-            LIBRARY_SECTIONS, rk_map, guid_map, title_map, cutoff
+        # Inventory + PREFILTER fetch
+        movie_candidates, ep_candidates = build_inventory_with_cache_and_prefilter(
+            LIBRARY_SECTIONS, rk_map, guid_map, title_map, cutoff, wb, sb,
+            PREFETCH_LIMIT_MOVIES, PREFETCH_LIMIT_EPISODES
         )
 
-        # Score separately (collect breakdowns for LLM)
+        # Score (collect breakdowns)
         log.info("Scoring %d movie candidates and %d episode candidates...", len(movie_candidates), len(ep_candidates))
         t0 = time.time()
         movie_breakdowns: Dict[int, Dict[str, float]] = {}
@@ -1102,39 +1190,43 @@ def main():
         scored_eps.sort(key=lambda x: x[0], reverse=True)
         log.info("Scoring complete (elapsed: %.2fs).", time.time() - t0)
 
-        # Load recommend history for decay
+        # Recommend history
         rechist = load_rechist()
 
         # Oversample so LLM can choose
         top_movies_initial = scored_movies[:max(TOPK_RECS, 10)*20]
         top_eps_initial    = scored_eps[:max(TOPK_RECS, 10)*20]
 
-        # LLM rerank per type
+        # LLM rerank
         final_movies = llm_rerank_list("Movies", top_movies_initial, top15_movies, bot15_movies,
                                        wbucket, season, movie_breakdowns, rechist)
         final_eps    = llm_rerank_list("TV Episodes", top_eps_initial, top15_eps, bot15_eps,
                                        wbucket, season, ep_breakdowns, rechist)
 
-        # Ensure fetched objects, enforce episode-per-show cap, then backfill to minimums
+        # Ensure objects, per-show cap
         final_movies = ensure_real_objects(final_movies)
         final_eps    = ensure_real_objects(final_eps)
         final_eps    = enforce_episode_show_cap(final_eps, EPISODE_SHOW_CAP)
 
-        # Backfill to guarantee TOPK_RECS for both collections
-        final_movies = backfill_to_min(
+        # Enforce never-watched limits + backfill to minimums
+        final_movies = limit_never_watched_and_backfill(
             "Movies",
             final_movies,
             scored_movies,
             TOPK_RECS,
+            MAX_NEVER_WATCHED_MOVIES,
+            rk_map, guid_map, title_map,
             is_tv=False,
             show_cap=0,
             rechist=rechist
         )
-        final_eps = backfill_to_min(
+        final_eps = limit_never_watched_and_backfill(
             "TV Episodes",
             final_eps,
             scored_eps,
             TOPK_RECS,
+            MAX_NEVER_WATCHED_EPISODES,
+            rk_map, guid_map, title_map,
             is_tv=True,
             show_cap=EPISODE_SHOW_CAP,
             rechist=rechist
@@ -1170,7 +1262,7 @@ def main():
             show = getattr(o, "grandparentTitle", "") or ""
             print(f"- {show} — {getattr(o,'title','?')} [S{sea:0>2}E{epi:0>2}] score={sc:.2f} last_seen={last_seen_str} genres={genres}")
 
-        # Context samplings (true highs/lows)
+        # Context samplings
         print("\n=== Highest rated Movies (top 15) ===")
         for o in top15_movies:
             print(f"- {o.title} ({getattr(o,'year','')}) | userRating={fetch_user_rating(o)}")
@@ -1203,7 +1295,7 @@ def main():
             if stype in ("show", "episode", "tv", "show-mixed") and tv_section_name is None:
                 tv_section_name = name
 
-        # Upsert collections: both types
+        # Upsert collections
         if movie_section_name:
             ensure_collection_update(movie_section_name, f"{COLLECTION_BASE} (Movies)", [o for _,o in final_movies[:TOPK_RECS]])
         else:
