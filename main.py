@@ -8,7 +8,8 @@ import json
 import hashlib
 import logging
 import datetime as dt
-from collections import Counter
+import random
+from collections import Counter, defaultdict
 from typing import Dict, List, Tuple, Optional, Set
 
 import requests
@@ -51,6 +52,7 @@ LON              = float(os.getenv("LON", "-75.1652"))
 USE_LLM          = os.getenv("USE_LLM", "false").lower() == "true"
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL     = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+LLM_SEND_N       = int(os.getenv("LLM_SEND_N", "120"))   # larger candidate sampling for LLM
 
 COLLECTION_BASE  = os.getenv("COLLECTION_BASE", "Recommended Today")
 LOOKBACK_MONTHS  = int(os.getenv("LOOKBACK_MONTHS", "7"))
@@ -58,12 +60,20 @@ MAX_HISTORY      = int(os.getenv("MAX_HISTORY", "1000"))
 TOPK_RECS        = int(os.getenv("TOPK_RECS", "10"))
 DRY_RUN          = os.getenv("DRY_RUN", "false").lower() == "true"
 
+# Re-recommend decay settings
+MIN_REREC_DAYS      = int(os.getenv("MIN_REREC_DAYS", "14"))
+FULL_RECOVERY_DAYS  = int(os.getenv("FULL_RECOVERY_DAYS", "45"))
+
+# Episode cap = max EPISODES PER SHOW (not number of shows)
+EPISODE_SHOW_CAP    = int(os.getenv("EPISODE_SHOW_CAP", "2"))
+
 # Caching
 CACHE_DIR              = os.path.join(BASE_DIR, ".cache")
 CACHE_TTL_MINUTES      = int(os.getenv("CACHE_TTL_MINUTES", "360"))  # 6h default
 REFRESH_CACHE          = os.getenv("REFRESH_CACHE", "false").lower() == "true"
 CACHE_KEY_PREFIX       = "inventory_v1"  # bump if you change structures
 ITEM_CACHE_PATH        = os.path.join(CACHE_DIR, "item_cache_v1.json")
+RECOMMEND_HISTORY_PATH = os.path.join(CACHE_DIR, "recommend_history_v1.json")
 
 # ----------------------------
 # Startup config dump
@@ -72,8 +82,10 @@ log.info("[CFG] PLEX_URL=%s", PLEX_URL)
 log.info("[CFG] LIBRARY_SECTIONS=%s", LIBRARY_SECTIONS)
 log.info("[CFG] LOOKBACK_MONTHS=%s MAX_HISTORY=%s TOPK_RECS=%s DRY_RUN=%s",
          LOOKBACK_MONTHS, MAX_HISTORY, TOPK_RECS, DRY_RUN)
-log.info("[LLM] enabled=%s | key=%s | model=%s",
-         USE_LLM, "yes" if OPENAI_API_KEY else "no", OPENAI_MODEL)
+log.info("[LLM] enabled=%s | key=%s | model=%s | send_n=%s",
+         USE_LLM, "yes" if OPENAI_API_KEY else "no", OPENAI_MODEL, LLM_SEND_N)
+log.info("[DECAY] min_days=%s full_recovery_days=%s | EPISODE_SHOW_CAP=%s",
+         MIN_REREC_DAYS, FULL_RECOVERY_DAYS, EPISODE_SHOW_CAP)
 log.info("[CACHE] dir=%s ttl_min=%s refresh=%s", CACHE_DIR, CACHE_TTL_MINUTES, REFRESH_CACHE)
 
 if not PLEX_TOKEN:
@@ -239,7 +251,6 @@ def build_last_seen_maps(history_rows: List[Dict]) -> Tuple[Dict[str,int], Dict[
     last_view_ts_by_guid: Dict[str,int] = {}
     last_view_ts_by_titlekey: Dict[str,int] = {}
 
-    # Fetch full items for unique ratingKeys
     unique_keys: List[str] = []
     for h in history_rows:
         rk = h.get("ratingKey")
@@ -355,7 +366,8 @@ def _extract_genres_with_fallback(item) -> List[str]:
     return genres
 
 def score_item(item, rk_map: Dict[str,int], guid_map: Dict[str,int], title_map: Dict[str,int],
-               weather_b: Dict[str,float], season_b: Dict[str,float]) -> float:
+               weather_b: Dict[str,float], season_b: Dict[str,float]) -> Tuple[float, Dict[str, float]]:
+    """Return (score, breakdown) so we can explain to the LLM."""
     lv = last_seen_timestamp(item, rk_map, guid_map, title_map)
     days = None
     if lv:
@@ -372,13 +384,23 @@ def score_item(item, rk_map: Dict[str,int], guid_map: Dict[str,int], title_map: 
             show = item.show()
             s_rating = getattr(show, "userRating", None)
             if s_rating:
-                show_bonus = (s_rating/10.0) * 0.5  # small nudge for shows you rated well
+                show_bonus = (s_rating/10.0) * 0.5
         except Exception:
             pass
-    return base + my_rating_term + rec + mood + show_bonus
+    total = base + my_rating_term + rec + mood + show_bonus
+    breakdown = {
+        "base": base,
+        "my_rating_term": my_rating_term,
+        "recency_term": rec,
+        "mood_term": mood,
+        "show_bonus": show_bonus,
+        "days_since_watch": (days if days is not None else -1),
+        "user_rating": (ur if ur is not None else -1),
+    }
+    return total, breakdown
 
 # ----------------------------
-# Caching helpers
+# Recommendation history cache (decay)
 # ----------------------------
 def ensure_cache_dir():
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -416,6 +438,16 @@ def save_item_cache(cache: Dict[str, dict]):
     ensure_cache_dir()
     save_json(ITEM_CACHE_PATH, cache)
 
+def load_rechist() -> Dict[str, dict]:
+    try:
+        return load_json(RECOMMEND_HISTORY_PATH)
+    except Exception:
+        return {}
+
+def save_rechist(hist: Dict[str, dict]):
+    ensure_cache_dir()
+    save_json(RECOMMEND_HISTORY_PATH, hist)
+
 def snapshot_item_fields(it) -> dict:
     genres = _extract_genres_with_fallback(it)
     try:
@@ -434,6 +466,49 @@ def snapshot_item_fields(it) -> dict:
         "lastSeenTs": last_seen_ts,
         "updatedAt": int(time.time()),
     }
+
+def decay_penalty(now_ts: int, last_rec_ts: int) -> Tuple[bool, float]:
+    """
+    Returns (blocked, penalty_factor). blocked=True if inside MIN_REREC_DAYS.
+    Otherwise returns a 0..0.5 penalty (subtract from score) decaying to 0 by FULL_RECOVERY_DAYS.
+    """
+    delta_days = (now_ts - last_rec_ts) / 86400.0
+    if delta_days < MIN_REREC_DAYS:
+        return True, 0.5  # blocked window
+    if delta_days >= FULL_RECOVERY_DAYS:
+        return False, 0.0
+    f = 1.0 - (delta_days - MIN_REREC_DAYS) / max(1.0, (FULL_RECOVERY_DAYS - MIN_REREC_DAYS))
+    return False, 0.5 * max(0.0, min(1.0, f))
+
+def adjust_for_rerec(score: float, item, _rk_map_unused: Dict[str,int], rechist: Dict[str, dict]) -> Tuple[float, bool]:
+    """Apply decay/blocks if the item was recently recommended but not watched yet."""
+    rk = str(getattr(item, "ratingKey", "") or "")
+    if not rk:
+        return score, False
+    rec = rechist.get(rk)
+    if not rec:
+        return score, False
+
+    last_rec_ts = rec.get("last_recommended_ts", 0)
+    if not last_rec_ts:
+        return score, False
+
+    # If watched after recommended → clear history entry
+    lv = None
+    try:
+        lva = getattr(item, "lastViewedAt", None)
+        if lva:
+            lv = int(lva.timestamp())
+    except Exception:
+        pass
+    if lv and lv > last_rec_ts:
+        rechist.pop(rk, None)
+        return score, False
+
+    blocked, pen = decay_penalty(int(time.time()), last_rec_ts)
+    if blocked:
+        return -1e9, True  # effectively exclude
+    return score - pen, False
 
 # ----------------------------
 # Inventory (Movies + Episodes) with caching
@@ -612,12 +687,170 @@ def ensure_collection_update(section_name: str, title: str, items: List):
         raise
 
 # ----------------------------
-# LLM (optional) — per type
+# Top/Bottom context from full library (no overlap)
 # ----------------------------
+def _iter_all_items_for_type(sections: List[str], kind: str) -> List[object]:
+    """All items of a type from library (no cutoff)."""
+    out = []
+    for name in sections:
+        try:
+            section = plex.library.section(name)
+        except Exception:
+            continue
+        stype = getattr(section, "type", None)
+        if kind == "movie" and stype == "movie":
+            try:
+                out.extend([m for m in section.all() if getattr(m, "type", "") == "movie"])
+            except Exception:
+                pass
+        elif kind == "episode" and stype in ("show", "episode", "tv", "show-mixed"):
+            try:
+                for sh in section.all():
+                    try:
+                        out.extend([ep for ep in sh.episodes() if getattr(ep, "type", "") == "episode"])
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+    return out
+
+def build_rating_context_all(sections: List[str], kind: str, top_n: int = 15) -> Tuple[List[object], List[object]]:
+    """
+    True top/bottom lists (no overlap) from entire library by userRating.
+    'kind' is 'movie' or 'episode'.
+    """
+    items = _iter_all_items_for_type(sections, kind)
+    rated = [(getattr(i, "userRating", None) or -1, i) for i in items]
+    rated = [p for p in rated if p[0] >= 0]  # only items you rated
+    if not rated:
+        return [], []
+
+    # Highest — bias to 9–10 if available
+    rated.sort(key=lambda x: x[0], reverse=True)
+    highest = []
+    seen = set()
+    for r, it in rated:
+        rk = getattr(it, "ratingKey", None)
+        if rk in seen:
+            continue
+        highest.append(it)
+        seen.add(rk)
+        if len(highest) >= top_n:
+            break
+
+    high9 = [it for it in highest if (getattr(it, "userRating", 0) or 0) >= 9]
+    if len(high9) >= 6:
+        highest = high9[:min(len(high9), top_n)]
+
+    # Lowest — exclude anything already in highest
+    rated_lo = sorted(rated, key=lambda x: x[0])  # ascending
+    lowest = []
+    for r, it in rated_lo:
+        rk = getattr(it, "ratingKey", None)
+        if rk in seen:
+            continue
+        lowest.append(it)
+        if len(lowest) >= top_n:
+            break
+
+    return highest, lowest
+
+# ----------------------------
+# LLM helpers
+# ----------------------------
+def _candidate_json_tuple(score: float, breakdown: Dict[str, float], obj) -> Dict:
+    t = getattr(obj, "type", "")
+    title = getattr(obj, "title", "")
+    year = getattr(obj, "year", "")
+    rk = getattr(obj, "ratingKey", None)
+    genres = _extract_genres_with_fallback(obj)
+    show_title = ""
+    sea = None
+    epi = None
+    show_rating = None
+    try:
+        if t == "episode":
+            show_title = getattr(obj, "grandparentTitle", "") or ""
+            sea = getattr(obj, "seasonNumber", None)
+            epi = getattr(obj, "index", None)
+            sh = obj.show()
+            if sh:
+                show_rating = getattr(sh, "userRating", None)
+    except Exception:
+        pass
+    return {
+        "ratingKey": rk,
+        "title": title,
+        "year": year,
+        "type": t,
+        "genres": genres,
+        "user_rating": breakdown.get("user_rating", -1),
+        "days_since_watch": breakdown.get("days_since_watch", -1),
+        "score_components": {
+            "base": breakdown.get("base", 0.0),
+            "my_rating_term": breakdown.get("my_rating_term", 0.0),
+            "recency_term": breakdown.get("recency_term", 0.0),
+            "mood_term": breakdown.get("mood_term", 0.0),
+            "show_bonus": breakdown.get("show_bonus", 0.0),
+        },
+        "total_score": score,
+        "episode_info": {
+            "show_title": show_title,
+            "season": sea,
+            "episode": epi,
+            "show_user_rating": show_rating
+        }
+    }
+
+def stratified_pool(scored: List[Tuple[float, object]], send_n: int) -> List[Tuple[float, object]]:
+    """
+    Build a diverse pool: top / middle / long-tail slices.
+    Deterministic-ish via date-based seed to vary day-to-day.
+    """
+    n = len(scored)
+    if n <= send_n:
+        return scored[:]
+
+    today_seed = int(dt.datetime.now().strftime("%Y%m%d"))
+    random.seed(today_seed)
+
+    top_n = max(10, int(send_n * 0.4))
+    mid_n = max(10, int(send_n * 0.35))
+    tail_n = max(10, send_n - top_n - mid_n)
+
+    top_slice = scored[:max(top_n*2, top_n+20)]
+    mid_start = n // 3
+    mid_end = 2 * n // 3
+    mid_slice = scored[mid_start:mid_end]
+    tail_slice = scored[-max(tail_n*6, tail_n+60):]
+
+    def pick(sample, k):
+        if len(sample) <= k:
+            return sample[:]
+        idxs = sorted(random.sample(range(len(sample)), k))
+        return [sample[i] for i in idxs]
+
+    out = []
+    out.extend(pick(top_slice, top_n))
+    out.extend(pick(mid_slice, mid_n))
+    out.extend(pick(tail_slice, tail_n))
+
+    seen = set()
+    dedup = []
+    for sc, o in out:
+        rk = getattr(o, "ratingKey", None)
+        if rk in seen:
+            continue
+        seen.add(rk)
+        dedup.append((sc, o))
+    return dedup[:send_n]
+
 def llm_rerank_list(label: str,
                     candidates: List[Tuple[float,object]],
                     top_hi: List[object], top_lo: List[object],
-                    weather: str, season: str):
+                    weather: str, season: str,
+                    scored_breakdowns: Dict[int, Dict[str, float]],
+                    rechist: Dict[str, dict]):
     if not USE_LLM:
         log.info("[LLM] %s: Disabled by USE_LLM=false.", label)
         return candidates[:TOPK_RECS]
@@ -630,64 +863,107 @@ def llm_rerank_list(label: str,
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-        send_n = min(50, len(candidates))
-        log.info("[LLM] %s: Sending %d candidates to %s ...", label, send_n, OPENAI_MODEL)
 
-        def item_line(o, s=None):
-            genres = ",".join([g.tag for g in getattr(o, "genres", [])]) if getattr(o,"genres",None) else ""
+        # Build a stratified, decay-adjusted pool
+        pool = stratified_pool(candidates, min(LLM_SEND_N, len(candidates)))
+
+        send_objs = []
+        kept_pairs = []
+        blocked_count = 0
+        for sc, o in pool:
+            rk = getattr(o, "ratingKey", None)
+            sc_b = scored_breakdowns.get(int(rk)) if rk is not None else None
+            if sc_b is None:
+                sc_b = {"base": 0.0, "my_rating_term": 0.0, "recency_term": 0.0, "mood_term": 0.0,
+                        "show_bonus": 0.0, "days_since_watch": -1, "user_rating": -1}
+            adj_sc, blocked = adjust_for_rerec(sc, o, {}, rechist)
+            if blocked:
+                blocked_count += 1
+                continue
+            kept_pairs.append((adj_sc, o))
+            send_objs.append(_candidate_json_tuple(adj_sc, sc_b, o))
+
+        if not kept_pairs:
+            log.info("[LLM] %s: All candidates blocked by re-recency window; falling back to original candidates.", label)
+            kept_pairs = candidates[:LLM_SEND_N]
+            send_objs = []
+            for sc, o in kept_pairs:
+                rk = getattr(o, "ratingKey", None)
+                sc_b = scored_breakdowns.get(int(rk)) if rk is not None else {}
+                send_objs.append(_candidate_json_tuple(sc, sc_b, o))
+
+        log.info("[LLM] %s: Sending %d candidates (blocked=%d) to %s ...", label, len(send_objs), blocked_count, OPENAI_MODEL)
+
+        def simple_line(o):
+            t = getattr(o, "type", "")
+            ttl = getattr(o, "title", "")
             yr = getattr(o, "year", "")
-            t  = getattr(o, "type", "")
-            ttl= getattr(o, "title", "")
             if t == "episode":
-                s_num = getattr(o, "seasonNumber", "?")
-                e_num = getattr(o, "index", "?")
-                ttl = f"{ttl} S{s_num:0>2}E{e_num:0>2}"
-            return f"{ttl} ({yr}) [{t}] g={genres} baseScore={s if s is not None else ''}"
+                sea = getattr(o, "seasonNumber", "?")
+                epi = getattr(o, "index", "?")
+                ttl = f"{ttl} S{int(sea):0>2}E{int(epi):0>2}" if isinstance(sea, int) and isinstance(epi, int) else f"{ttl}"
+            return f"{ttl} ({yr}) [{t}]"
 
-        lines = "\n".join(item_line(o, sc) for sc,o in candidates[:send_n])
-        hi = "\n".join(item_line(o) for o in top_hi[:15])
-        lo = "\n".join(item_line(o) for o in top_lo[:15])
-        prompt = f"""You are picking the best {label.lower()} for tonight.
-Weather: {weather}; Season: {season}.
-I value: my own ratings first, then how long since last watch (older is better), then season/weather fit.
-Here are candidates with a pre-score:
-{lines}
+        hi = "\n".join(simple_line(o) for o in top_hi[:15])
+        lo = "\n".join(simple_line(o) for o in top_lo[:15])
 
-Context: my 15 highest-rated {label.lower()}:
-{hi}
-
-Context: my 15 lowest-rated {label.lower()}:
-{lo}
-
-Return a JSON array of the top {TOPK_RECS} titles from the candidates (use exact titles), in ranked order.
-"""
+        prompt = {
+            "task": f"Select the top {TOPK_RECS} {label.lower()} to recommend tonight.",
+            "preferences": [
+                "Prioritize my user rating first.",
+                "Prefer things I haven't seen in a long time (more days since last watch is better).",
+                "Season & weather genre fit should influence ties.",
+                "A mix of obvious favorites and some variety is welcome."
+            ],
+            "context": {
+                "weather_bucket": weather,
+                "season": season,
+                "highest_rated_examples": hi,
+                "lowest_rated_examples": lo
+            },
+            "candidates": send_objs,
+            "output_format": {
+                "type": "json",
+                "fields": ["ratingKey"],
+                "array_name": "picks"
+            },
+            "instructions": [
+                "Return JSON only. Example: {\"picks\": [12345, 67890, ...]}",
+                f"Pick exactly {TOPK_RECS} unique ratingKeys, in order of recommendation strength."
+            ]
+        }
 
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role":"user","content":prompt}],
+            messages=[
+                {"role": "system", "content": "You are a sharp, decisive recommender. Output strictly valid JSON only."},
+                {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)}
+            ],
             temperature=0.2
         )
         text = resp.choices[0].message.content.strip()
-        log.info("[LLM] %s: Response received.", label)
 
         import re as _re
-        import json as _json
-        arr = _json.loads(_re.search(r"\[.*\]", text, _re.S).group(0))
+        data = json.loads(_re.search(r"\{.*\}", text, _re.S).group(0))
+        rk_list = data.get("picks", [])
 
-        by_title = {getattr(o,"title",""): (sc,o) for sc,o in candidates}
+        by_rk = {int(getattr(o, "ratingKey", 0)): (sc, o) for sc, o in kept_pairs if getattr(o, "ratingKey", None) is not None}
+
         ordered = []
-        for t in arr:
-            pair = by_title.get(t)
+        for rk in rk_list:
+            pair = by_rk.get(int(rk))
             if pair:
                 ordered.append(pair)
 
         if len(ordered) < TOPK_RECS:
-            seen = set(id(o) for _,o in ordered)
-            for sc,o in candidates:
-                if id(o) not in seen:
-                    ordered.append((sc,o))
+            seen = set(getattr(o, "ratingKey", None) for _, o in ordered)
+            for sc, o in kept_pairs:
+                rk = getattr(o, "ratingKey", None)
+                if rk not in seen:
+                    ordered.append((sc, o))
                 if len(ordered) >= TOPK_RECS:
                     break
+
         return ordered[:TOPK_RECS]
     except Exception as e:
         log.exception("[LLM] %s: Error during re-rank: %s", label, e)
@@ -702,6 +978,66 @@ def ensure_real_objects(pairs: List[Tuple[float, object]]) -> List[Tuple[float, 
             except Exception:
                 continue
         out.append((sc, o))
+    return out
+
+# Enforce MAX EPISODES PER SHOW (not number of shows)
+def enforce_episode_show_cap(pairs: List[Tuple[float, object]], cap: int) -> List[Tuple[float, object]]:
+    if cap <= 0:
+        return pairs
+    counts = defaultdict(int)
+    out = []
+    for sc, o in pairs:
+        if getattr(o, "type", "") != "episode":
+            out.append((sc, o))
+            continue
+        show = getattr(o, "grandparentTitle", "") or ""
+        if counts[show] < cap:
+            out.append((sc, o))
+            counts[show] += 1
+    return out
+
+# ----------------------------
+# Backfill to guaranteed minimums
+# ----------------------------
+def _not_in_selected(selected: List[Tuple[float, object]], cand_obj) -> bool:
+    sel_ids = {getattr(o, "ratingKey", None) for _, o in selected}
+    return getattr(cand_obj, "ratingKey", None) not in sel_ids
+
+def _passes_show_cap(selected: List[Tuple[float, object]], cand_obj, cap: int) -> bool:
+    if getattr(cand_obj, "type", "") != "episode" or cap <= 0:
+        return True
+    from collections import Counter
+    counts = Counter(getattr(o, "grandparentTitle", "") or "" for _, o in selected if getattr(o, "type", "") == "episode")
+    return counts[(getattr(cand_obj, "grandparentTitle", "") or "")] < cap
+
+def backfill_to_min(
+    label: str,
+    selected: List[Tuple[float, object]],
+    scored_all: List[Tuple[float, object]],
+    desired_n: int,
+    is_tv: bool = False,
+    show_cap: int = 0,
+    rechist: Optional[Dict[str, dict]] = None
+) -> List[Tuple[float, object]]:
+    """
+    Ensure we reach desired_n items by walking the scored list and adding the next best
+    that aren't selected yet; respect per-show episode cap and decay/blocks.
+    """
+    rechist = rechist or {}
+    out = list(selected)
+    for sc, o in scored_all:
+        if len(out) >= desired_n:
+            break
+        adj_sc, blocked = adjust_for_rerec(sc, o, {}, rechist)
+        if blocked:
+            continue
+        if not _not_in_selected(out, o):
+            continue
+        if is_tv and not _passes_show_cap(out, o, show_cap):
+            continue
+        out.append((adj_sc, o))
+    if len(out) < desired_n:
+        log.warning("[%s] Could not reach desired minimum %d (have %d).", label, desired_n, len(out))
     return out
 
 # ----------------------------
@@ -731,73 +1067,110 @@ def main():
         # Build last-seen maps from filtered history
         rk_map, guid_map, title_map = build_last_seen_maps(history)
 
-        # Highest/lowest samplings per TYPE (from your filtered history)
-        movies_hist = []
-        eps_hist = []
-        for rk in set(int(h.get("ratingKey")) for h in history if h.get("ratingKey")):
-            try:
-                it = plex.fetchItem(int(rk))
-            except Exception:
-                continue
-            if getattr(it, "type", "") == "movie":
-                movies_hist.append(it)
-            elif getattr(it, "type", "") == "episode":
-                eps_hist.append(it)
-
-        def rated_sorted(items):
-            pairs = [(fetch_user_rating(i) or -1, i) for i in items]
-            pairs = [p for p in pairs if p[0] >= 0]
-            pairs.sort(key=lambda x: x[0], reverse=True)
-            top15 = [it for _,it in pairs[:15]]
-            bot15 = [it for _,it in sorted(pairs, key=lambda x: x[0])[:15]]
-            return top15, bot15
-
-        top15_movies, bot15_movies = rated_sorted(movies_hist)
-        top15_eps,    bot15_eps    = rated_sorted(eps_hist)
+        # Build true top/bottom contexts from full library (no overlap)
+        top15_movies, bot15_movies = build_rating_context_all(LIBRARY_SECTIONS, "movie", top_n=15)
+        top15_eps,    bot15_eps    = build_rating_context_all(LIBRARY_SECTIONS, "episode", top_n=15)
 
         # Inventory from cache (fast), filtered by cutoff using last-seen maps
         movie_candidates, ep_candidates = build_inventory_with_cache(
             LIBRARY_SECTIONS, rk_map, guid_map, title_map, cutoff
         )
 
-        # Score separately
+        # Score separately (collect breakdowns for LLM)
         log.info("Scoring %d movie candidates and %d episode candidates...", len(movie_candidates), len(ep_candidates))
         t0 = time.time()
-        scored_movies: List[Tuple[float, object]] = [(score_item(it, rk_map, guid_map, title_map, wb, sb), it) for it in movie_candidates]
-        scored_eps:    List[Tuple[float, object]] = [(score_item(it, rk_map, guid_map, title_map, wb, sb), it) for it in ep_candidates]
+        movie_breakdowns: Dict[int, Dict[str, float]] = {}
+        ep_breakdowns: Dict[int, Dict[str, float]] = {}
+        scored_movies: List[Tuple[float, object]] = []
+        scored_eps:    List[Tuple[float, object]] = []
+
+        for it in movie_candidates:
+            sc, br = score_item(it, rk_map, guid_map, title_map, wb, sb)
+            rk = getattr(it, "ratingKey", None)
+            if rk is not None:
+                movie_breakdowns[int(rk)] = br
+            scored_movies.append((sc, it))
+
+        for it in ep_candidates:
+            sc, br = score_item(it, rk_map, guid_map, title_map, wb, sb)
+            rk = getattr(it, "ratingKey", None)
+            if rk is not None:
+                ep_breakdowns[int(rk)] = br
+            scored_eps.append((sc, it))
+
         scored_movies.sort(key=lambda x: x[0], reverse=True)
         scored_eps.sort(key=lambda x: x[0], reverse=True)
         log.info("Scoring complete (elapsed: %.2fs).", time.time() - t0)
 
-        # Top K per type + optional LLM per type
-        top_movies_initial = scored_movies[:max(TOPK_RECS, 10)]
-        top_eps_initial    = scored_eps[:max(TOPK_RECS, 10)]
+        # Load recommend history for decay
+        rechist = load_rechist()
 
-        final_movies = llm_rerank_list("Movies", top_movies_initial, top15_movies, bot15_movies, wbucket, season)
-        final_eps    = llm_rerank_list("TV Episodes", top_eps_initial, top15_eps, bot15_eps, wbucket, season)
+        # Oversample so LLM can choose
+        top_movies_initial = scored_movies[:max(TOPK_RECS, 10)*20]
+        top_eps_initial    = scored_eps[:max(TOPK_RECS, 10)*20]
 
-        # Ensure fetched objects for final lists (lazy ints → objects)
+        # LLM rerank per type
+        final_movies = llm_rerank_list("Movies", top_movies_initial, top15_movies, bot15_movies,
+                                       wbucket, season, movie_breakdowns, rechist)
+        final_eps    = llm_rerank_list("TV Episodes", top_eps_initial, top15_eps, bot15_eps,
+                                       wbucket, season, ep_breakdowns, rechist)
+
+        # Ensure fetched objects, enforce episode-per-show cap, then backfill to minimums
         final_movies = ensure_real_objects(final_movies)
         final_eps    = ensure_real_objects(final_eps)
+        final_eps    = enforce_episode_show_cap(final_eps, EPISODE_SHOW_CAP)
+
+        # Backfill to guarantee TOPK_RECS for both collections
+        final_movies = backfill_to_min(
+            "Movies",
+            final_movies,
+            scored_movies,
+            TOPK_RECS,
+            is_tv=False,
+            show_cap=0,
+            rechist=rechist
+        )
+        final_eps = backfill_to_min(
+            "TV Episodes",
+            final_eps,
+            scored_eps,
+            TOPK_RECS,
+            is_tv=True,
+            show_cap=EPISODE_SHOW_CAP,
+            rechist=rechist
+        )
+
+        # Record recommendations in history (for decay)
+        now_ts = int(time.time())
+        for _, o in (final_movies + final_eps):
+            rk = str(getattr(o, "ratingKey", "") or "")
+            if not rk:
+                continue
+            rec = rechist.get(rk, {})
+            rec["last_recommended_ts"] = now_ts
+            rec["times"] = int(rec.get("times", 0)) + 1
+            rechist[rk] = rec
+        save_rechist(rechist)
 
         # Log outputs
         print("\n=== Final Recommendations — Movies (Top 10) ===")
-        for sc, o in final_movies:
+        for sc, o in final_movies[:TOPK_RECS]:
             lv = last_seen_timestamp(o, rk_map, guid_map, title_map)
             last_seen_str = dt.datetime.fromtimestamp(lv).strftime("%Y-%m-%d") if lv else "never"
             genres = ",".join(_extract_genres_with_fallback(o))
             print(f"- {getattr(o,'title','?')} ({getattr(o,'year','')}) [Movie] score={sc:.2f} last_seen={last_seen_str} genres={genres}")
 
-        print("\n=== Final Recommendations — TV Episodes (Top 10) ===")
-        for sc, o in final_eps:
+        print(f"\n=== Final Recommendations — TV Episodes (Top 10, max {EPISODE_SHOW_CAP} episodes per show) ===")
+        for sc, o in final_eps[:TOPK_RECS]:
             lv = last_seen_timestamp(o, rk_map, guid_map, title_map)
             last_seen_str = dt.datetime.fromtimestamp(lv).strftime("%Y-%m-%d") if lv else "never"
             genres = ",".join(_extract_genres_with_fallback(o))
             sea = getattr(o, "seasonNumber", "?")
             epi = getattr(o, "index", "?")
-            print(f"- {getattr(o,'title','?')} ({getattr(o,'year','')}) [S{sea:0>2}E{epi:0>2}] score={sc:.2f} last_seen={last_seen_str} genres={genres}")
+            show = getattr(o, "grandparentTitle", "") or ""
+            print(f"- {show} — {getattr(o,'title','?')} [S{sea:0>2}E{epi:0>2}] score={sc:.2f} last_seen={last_seen_str} genres={genres}")
 
-        # Context samplings (separate by type)
+        # Context samplings (true highs/lows)
         print("\n=== Highest rated Movies (top 15) ===")
         for o in top15_movies:
             print(f"- {o.title} ({getattr(o,'year','')}) | userRating={fetch_user_rating(o)}")
@@ -832,12 +1205,12 @@ def main():
 
         # Upsert collections: both types
         if movie_section_name:
-            ensure_collection_update(movie_section_name, f"{COLLECTION_BASE} (Movies)", [o for _,o in final_movies])
+            ensure_collection_update(movie_section_name, f"{COLLECTION_BASE} (Movies)", [o for _,o in final_movies[:TOPK_RECS]])
         else:
             log.warning("No Movie library found among LIBRARY_SECTIONS=%s; skipping Movies collection.", LIBRARY_SECTIONS)
 
         if tv_section_name:
-            ensure_collection_update(tv_section_name, f"{COLLECTION_BASE} (TV)", [o for _,o in final_eps])
+            ensure_collection_update(tv_section_name, f"{COLLECTION_BASE} (TV)", [o for _,o in final_eps[:TOPK_RECS]])
         else:
             log.warning("No TV library found among LIBRARY_SECTIONS=%s; skipping TV collection.", LIBRARY_SECTIONS)
 
