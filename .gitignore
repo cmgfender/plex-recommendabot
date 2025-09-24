@@ -1,0 +1,61 @@
+# ----------------------------
+# Node.js / JavaScript
+# ----------------------------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+
+# ----------------------------
+# Python
+# ----------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# ----------------------------
+# Logs & Runtime
+# ----------------------------
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+
+# ----------------------------
+# OS / Editor Files
+# ----------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ----------------------------
+# Environment & Credentials
+# ----------------------------
+.env
+.env.*
+*.local
+
+# ----------------------------
+# HubSpot / Project Artifacts
+# ----------------------------
+# HubSpot CMS local dev tool
+.hubspotcms
+# Ignore HubSpot temporary sync/cache
+.hubspot/*
+.hubspot-cache/
+# API credentials if stored locally
+hubspot.config.json
