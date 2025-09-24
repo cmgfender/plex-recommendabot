@@ -1,61 +1,66 @@
-# ----------------------------
-# Node.js / JavaScript
-# ----------------------------
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-.pnpm-debug.log*
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
 
-# ----------------------------
-# Python
-# ----------------------------
+# --- Python ---
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.pdb
+*$py.class
+.env
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
 *.egg-info/
 .eggs/
 dist/
 build/
+site/
+.wheels/
+*.egg
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pyre/
+.pytype/
+.dmypy.json
 
-# ----------------------------
-# Logs & Runtime
-# ----------------------------
+# --- Logs / runtime ---
 *.log
 logs/
 *.pid
-*.seed
-*.pid.lock
 
-# ----------------------------
-# OS / Editor Files
-# ----------------------------
-.DS_Store
-Thumbs.db
-ehthumbs.db
-Icon?
-.idea/
+# --- Editor / IDE ---
 .vscode/
+.vscode-test/
+.idea/
 *.swp
 *.swo
 
-# ----------------------------
-# Environment & Credentials
-# ----------------------------
-.env
-.env.*
-*.local
+# --- Jupyter (if you experiment) ---
+.ipynb_checkpoints/
+*.ipynb
 
-# ----------------------------
-# HubSpot / Project Artifacts
-# ----------------------------
-# HubSpot CMS local dev tool
-.hubspotcms
-# Ignore HubSpot temporary sync/cache
-.hubspot/*
-.hubspot-cache/
-# API credentials if stored locally
-hubspot.config.json
+# --- Docker ---
+docker-compose.override.yml
+**/.dockerignore
+*.tar
+
+# --- Project-specific (Plex recommendabot) ---
+.cache/
+.cache/*
+# Per-item cache file created by the script
+.cache/item_cache_v1.json
+
+# Prevent committing local config & secrets
+.env.local
+.env.*.local
+# (already ignoring .env above, but keep it explicit)
+.env
+
+# --- Optional: OS/FS metadata ---
+Icon?
+Desktop.ini
