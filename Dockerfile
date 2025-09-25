@@ -15,4 +15,4 @@ COPY . .
 
 # Set the command to run when the container starts
 # Replace 'your_script_name.py' with the actual name of your script
-CMD ["python3", "./your_script_name.py"]
+CMD ["python3", "./main.py"]
