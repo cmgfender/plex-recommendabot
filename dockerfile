@@ -1,16 +1,18 @@
+# Use an official lightweight Python image
 FROM python:3.11-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates && rm -rf /var/lib/apt/lists/*
-
+# Set the working directory inside the container
 WORKDIR /app
-COPY requirements.txt /app/
+
+# Copy the requirements file first to leverage Docker's layer caching
+COPY requirements.txt .
+
+# Install the Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py /app/
+# Copy your script and the .env file into the container
+COPY . .
 
-# Expect .env to be mounted or variables passed with -e
-CMD ["python", "main.py"]
+# Set the command to run when the container starts
+# Replace 'your_script_name.py' with the actual name of your script
+CMD ["python3", "./your_script_name.py"]
